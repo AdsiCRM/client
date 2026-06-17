@@ -1,0 +1,5 @@
+# Set DOMAIN in .env (e.g. DOMAIN=crm.example.com). Caddy auto-provisions
+# Let's Encrypt TLS for a real domain; for DOMAIN=localhost it uses a local cert.
+{$DOMAIN:localhost} {
+	reverse_proxy frontend:3000
+}

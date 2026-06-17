@@ -47,12 +47,16 @@ services:
       - redis
 
   frontend:
-    image: ghcr.io/adsicrm/adsicrm-frontend:latest
+    image: ghcr.io/adsicrm/adsicrm-frontend:0.1.1
     platform: linux/amd64
     container_name: adsicrm-frontend
     restart: always
     ports:
       - "${FRONTEND_PORT:-3001}:3000"
+    environment:
+      # Адрес бэка внутри compose-сети. Читается фронтом в рантайме
+      # (src/app/backend/[...slug]/route.ts). Без него фронт виснет.
+      INTERNAL_API_URL: http://backend:3000
     depends_on:
       - backend
 

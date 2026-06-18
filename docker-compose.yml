@@ -49,7 +49,7 @@ services:
       - redis
 
   frontend:
-    image: ghcr.io/adsicrm/adsicrm-frontend:0.1.2
+    image: ghcr.io/adsicrm/adsicrm-frontend:0.1.3
     platform: linux/amd64
     container_name: adsicrm-frontend
     restart: always

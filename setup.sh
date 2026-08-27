@@ -4,6 +4,121 @@ set -e
 echo "=== AdsiCRM Setup ==="
 echo ""
 
+# 0. Check host dependencies (Docker + Python3) and install whatever's missing —
+# so a bare VPS with nothing preinstalled still ends up with a fully working CRM,
+# instead of failing halfway through with a confusing "command not found".
+
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
+detect_pkg_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "yum"
+  else
+    echo "unknown"
+  fi
+}
+PKG_MANAGER=$(detect_pkg_manager)
+
+install_package() {
+  pkg="$1"
+  case "$PKG_MANAGER" in
+    apt)
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y "$pkg"
+      ;;
+    dnf)
+      $SUDO dnf install -y "$pkg"
+      ;;
+    yum)
+      $SUDO yum install -y "$pkg"
+      ;;
+    *)
+      echo "ERROR: Could not detect a supported package manager (apt/dnf/yum) to install '$pkg'."
+      echo "Please install '$pkg' manually and re-run this script."
+      exit 1
+      ;;
+  esac
+}
+
+fetch_and_run_as_root() {
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" | $SUDO sh
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$url" | $SUDO sh
+  else
+    echo "ERROR: Neither curl nor wget found — cannot download the Docker installer."
+    echo "Please install curl or wget, or install Docker manually: https://docs.docker.com/engine/install/"
+    exit 1
+  fi
+}
+
+echo "▸ Checking host dependencies..."
+
+# Docker + the Compose plugin (checked together — "docker compose version" only
+# succeeds if both are present and working).
+if ! docker compose version >/dev/null 2>&1; then
+  echo "  Docker (or the Compose plugin) not found — installing via get.docker.com..."
+  fetch_and_run_as_root https://get.docker.com
+  $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: Docker installation failed. Please install it manually: https://docs.docker.com/engine/install/"
+    exit 1
+  fi
+  echo "  Docker installed successfully."
+else
+  echo "  Docker: OK"
+fi
+
+# The daemon itself might be stopped even if the CLI is installed.
+if ! docker info >/dev/null 2>&1; then
+  echo "  Docker daemon isn't running — starting it..."
+  $SUDO systemctl start docker >/dev/null 2>&1 || $SUDO service docker start >/dev/null 2>&1 || true
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Could not start the Docker daemon. Please start it manually and re-run this script."
+    exit 1
+  fi
+fi
+
+# Python3 (needed by the planned self-update daemon; harmless to have regardless).
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  python3 not found — installing..."
+  install_package python3
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 installation failed. Please install it manually and re-run this script."
+    exit 1
+  fi
+  echo "  python3 installed successfully."
+else
+  echo "  python3: OK"
+fi
+
+# nginx (host-level, not a container — terminates the real public domain/TLS and
+# reverse-proxies to the frontend container; vhost/TLS setup itself is a separate
+# step, not done here).
+if ! command -v nginx >/dev/null 2>&1; then
+  echo "  nginx not found — installing..."
+  install_package nginx
+  if ! command -v nginx >/dev/null 2>&1; then
+    echo "ERROR: nginx installation failed. Please install it manually and re-run this script."
+    exit 1
+  fi
+  $SUDO systemctl enable --now nginx >/dev/null 2>&1 || true
+  echo "  nginx installed successfully."
+else
+  echo "  nginx: OK"
+fi
+
+echo ""
+
 # 1. Generate .env from .env.example if not exists
 if [ -f ".env" ]; then
   echo "▸ .env already exists, skipping generation."
@@ -15,10 +130,53 @@ else
 
   echo "▸ Generating .env from .env.example..."
 
+  # Ask once, up front — the nginx/TLS step further down re-derives everything
+  # it needs from .env on every run, so this block never has to run again even
+  # if the domain's DNS isn't ready yet on this first pass.
+  DOMAIN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+  DOMAIN=""
+  printf "▸ Do you have a domain pointing at this server? (y/n): "
+  read -r HAS_DOMAIN
+  case "$HAS_DOMAIN" in
+    y|Y|yes|Yes|YES)
+      while true; do
+        printf "  Enter the domain (e.g. example.com): "
+        read -r DOMAIN_INPUT
+        # Forgive a pasted protocol/trailing slash/stray whitespace before validating.
+        DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | sed -E 's#^https?://##; s#/+$##' | tr -d '[:space:]')
+        if echo "$DOMAIN_INPUT" | grep -Eq "$DOMAIN_REGEX"; then
+          DOMAIN="$DOMAIN_INPUT"
+          break
+        fi
+        echo "  Not a valid domain (expected something like example.com) — try again."
+      done
+      ;;
+    *)
+      echo "  No domain — the CRM will be reachable by this server's IP address instead."
+      ;;
+  esac
+
+  # CORS_ORIGIN starts on plain http even when a domain was given — TLS isn't
+  # active yet at this point (that happens further down, and may not succeed
+  # at all yet if the domain's DNS isn't live). The nginx/TLS step upgrades
+  # this to https itself, automatically, the moment a certificate exists.
+  if [ -n "$DOMAIN" ]; then
+    CORS_VALUE="http://$DOMAIN"
+  else
+    echo "▸ Detecting the server's public IP..."
+    PUBLIC_IP=$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -z "$PUBLIC_IP" ]; then
+      echo "  WARNING: Could not auto-detect the server's IP — defaulting to localhost. Fix CORS_ORIGIN in .env manually if needed."
+      PUBLIC_IP="localhost"
+    fi
+    CORS_VALUE="http://$PUBLIC_IP"
+  fi
+
   JWT_ACCESS=$(openssl rand -base64 64 | tr -d '\n')
   JWT_REFRESH=$(openssl rand -base64 64 | tr -d '\n')
   DB_PASS=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24)
   REDIS_PASS=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24)
+  UPDATER_TOKEN=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32)
 
   while IFS= read -r line; do
     case "$line" in
@@ -26,6 +184,9 @@ else
       REDIS_PASSWORD=CHANGE_ME*)     echo "REDIS_PASSWORD=$REDIS_PASS" ;;
       JWT_ACCESS_SECRET=CHANGE_ME*)  echo "JWT_ACCESS_SECRET=$JWT_ACCESS" ;;
       JWT_REFRESH_SECRET=CHANGE_ME*) echo "JWT_REFRESH_SECRET=$JWT_REFRESH" ;;
+      UPDATER_TOKEN=CHANGE_ME*)      echo "UPDATER_TOKEN=$UPDATER_TOKEN" ;;
+      DOMAIN=)                       echo "DOMAIN=$DOMAIN" ;;
+      CORS_ORIGIN=http://localhost:3001) echo "CORS_ORIGIN=$CORS_VALUE" ;;
       *)                             echo "$line" ;;
     esac
   done < .env.example > .env
@@ -88,14 +249,152 @@ docker exec adsicrm-backend node /app/prisma/seed.cjs
 echo "▸ Starting frontend and adminer..."
 docker compose up -d
 
+# 9. Install the self-update daemon as a systemd service. It has to run on the
+# HOST, never in a container — a container's own process tree dies the moment
+# `docker compose up -d` recreates it, so nothing living inside backend or
+# frontend can safely orchestrate replacing that same container (see
+# updater/daemon.py for the full reasoning). systemd keeps it running across
+# crashes and reboots without needing a login shell or a container for it.
+echo "▸ Installing self-update daemon..."
+
+CLIENT_DIR=$(pwd)
+UNIT_PATH="/etc/systemd/system/adsicrm-updater.service"
+
+chmod +x "$CLIENT_DIR/updater/check.sh" "$CLIENT_DIR/updater/update.sh" "$CLIENT_DIR/updater/daemon.py"
+
+if command -v systemctl >/dev/null 2>&1; then
+  PYTHON3_BIN=$(command -v python3)
+  cat <<EOF | $SUDO tee "$UNIT_PATH" >/dev/null
+[Unit]
+Description=AdsiCRM self-update daemon
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=$CLIENT_DIR
+EnvironmentFile=$CLIENT_DIR/.env
+ExecStart=$PYTHON3_BIN $CLIENT_DIR/updater/daemon.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now adsicrm-updater
+  echo "  Updater daemon installed and running (systemd unit: adsicrm-updater)."
+else
+  echo "  WARNING: systemctl not found — skipping updater daemon install."
+  echo "  In-app updates (Settings → System) won't work until it's running."
+  echo "  Run manually: UPDATER_TOKEN=... python3 $CLIENT_DIR/updater/daemon.py"
+fi
+
+# 10. Configure nginx (path-based routing: / -> frontend, /api -> backend) and
+# TLS. Runs on EVERY invocation and is fully idempotent — this is deliberately
+# the recovery path for "the domain's DNS wasn't ready during the first run":
+# just re-run this script after fixing DNS and it retries the certificate,
+# nothing else needs to be repeated by hand.
+echo "▸ Configuring nginx..."
+
+DOMAIN=$(grep -E '^DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+FRONTEND_PORT_VAL=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+BACKEND_PORT_VAL=$(grep -E '^BACKEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+FRONTEND_PORT_VAL=${FRONTEND_PORT_VAL:-3001}
+BACKEND_PORT_VAL=${BACKEND_PORT_VAL:-3000}
+
+if [ "$PKG_MANAGER" = "apt" ]; then
+  NGINX_CONF_PATH="/etc/nginx/sites-available/adsicrm"
+  NGINX_ENABLED_PATH="/etc/nginx/sites-enabled/adsicrm"
+else
+  NGINX_CONF_PATH="/etc/nginx/conf.d/adsicrm.conf"
+  NGINX_ENABLED_PATH=""
+fi
+
+# Only ever created once — certbot rewrites this same file in place once a
+# certificate is issued (adds the SSL server block + http->https redirect),
+# and re-running this script must never clobber that back to plain HTTP.
+if [ ! -f "$NGINX_CONF_PATH" ]; then
+  cat <<NGINXCONF | $SUDO tee "$NGINX_CONF_PATH" >/dev/null
+server {
+    listen 80;
+    server_name _;
+
+    location /api {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT_VAL};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${FRONTEND_PORT_VAL};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINXCONF
+
+  if [ -n "$NGINX_ENABLED_PATH" ] && [ ! -e "$NGINX_ENABLED_PATH" ]; then
+    $SUDO ln -s "$NGINX_CONF_PATH" "$NGINX_ENABLED_PATH"
+  fi
+
+  if $SUDO nginx -t >/dev/null 2>&1; then
+    $SUDO systemctl reload nginx >/dev/null 2>&1 || $SUDO service nginx reload >/dev/null 2>&1 || true
+    echo "  nginx configured (listening on :80)."
+  else
+    echo "  WARNING: nginx config test failed — check '$SUDO nginx -t' manually."
+  fi
+else
+  echo "  nginx already configured, skipping."
+fi
+
+# TLS — only possible with a real domain (Let's Encrypt won't issue for bare
+# IPs). Safe to retry: skips outright if a certificate already exists.
+if [ -n "$DOMAIN" ]; then
+  if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+    echo "  TLS certificate for $DOMAIN already present, skipping certbot."
+  else
+    echo "▸ Requesting a TLS certificate for $DOMAIN..."
+    if ! command -v certbot >/dev/null 2>&1; then
+      install_package certbot
+      install_package python3-certbot-nginx
+    fi
+    if command -v certbot >/dev/null 2>&1; then
+      if $SUDO certbot --nginx -d "$DOMAIN" --redirect --register-unsafely-without-email --non-interactive --agree-tos >/tmp/adsicrm-certbot.log 2>&1; then
+        echo "  TLS certificate obtained — $DOMAIN is now served over HTTPS."
+      else
+        echo "  WARNING: certbot failed (log: /tmp/adsicrm-certbot.log) — likely the domain's DNS A record isn't pointing at this server yet."
+        echo "  Once it is, just re-run this script (sh setup.sh) — it will retry automatically."
+      fi
+    else
+      echo "  WARNING: certbot installation failed — skipping TLS. Re-run this script once it's installed."
+    fi
+  fi
+
+  # Self-heals CORS_ORIGIN from http to https the moment a certificate exists —
+  # covers both "TLS just succeeded above" and "it was already there from a
+  # previous run". Only touches the value if it's still exactly our own http
+  # default, so a manually-customized CORS_ORIGIN is never overwritten.
+  if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+    CURRENT_CORS=$(grep -E '^CORS_ORIGIN=' .env 2>/dev/null | cut -d= -f2-)
+    if [ "$CURRENT_CORS" = "http://$DOMAIN" ]; then
+      TMP_ENV=$(mktemp)
+      awk -v val="CORS_ORIGIN=https://$DOMAIN" '/^CORS_ORIGIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+      echo "  CORS_ORIGIN upgraded to https://$DOMAIN"
+    fi
+  fi
+fi
+
 echo ""
 echo "Done! Services are available at:"
 
-FRONTEND_PORT=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
-BACKEND_PORT=$(grep -E '^BACKEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
 ADMINER_PORT=$(grep -E '^ADMINER_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+CORS_ORIGIN_VAL=$(grep -E '^CORS_ORIGIN=' .env 2>/dev/null | cut -d= -f2-)
 
-echo "  Frontend:  http://localhost:${FRONTEND_PORT:-3001}"
-echo "  Backend:   http://localhost:${BACKEND_PORT:-3000}/swagger"
-echo "  Adminer:   http://localhost:${ADMINER_PORT:-8978}"
+echo "  CRM:      ${CORS_ORIGIN_VAL:-http://localhost:3001}"
+echo "  Adminer:  http://localhost:${ADMINER_PORT:-8978} (SSH tunnel only — not linked from the CRM UI)"
 echo ""

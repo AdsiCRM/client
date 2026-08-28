@@ -130,48 +130,11 @@ else
 
   echo "▸ Generating .env from .env.example..."
 
-  # Ask once, up front — the nginx/TLS step further down re-derives everything
-  # it needs from .env on every run, so this block never has to run again even
-  # if the domain's DNS isn't ready yet on this first pass.
-  DOMAIN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-  DOMAIN=""
-  printf "▸ Do you have a domain pointing at this server? (y/n): "
-  read -r HAS_DOMAIN
-  case "$HAS_DOMAIN" in
-    y|Y|yes|Yes|YES)
-      while true; do
-        printf "  Enter the domain (e.g. example.com): "
-        read -r DOMAIN_INPUT
-        # Forgive a pasted protocol/trailing slash/stray whitespace before validating.
-        DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | sed -E 's#^https?://##; s#/+$##' | tr -d '[:space:]')
-        if echo "$DOMAIN_INPUT" | grep -Eq "$DOMAIN_REGEX"; then
-          DOMAIN="$DOMAIN_INPUT"
-          break
-        fi
-        echo "  Not a valid domain (expected something like example.com) — try again."
-      done
-      ;;
-    *)
-      echo "  No domain — the CRM will be reachable by this server's IP address instead."
-      ;;
-  esac
-
-  # CORS_ORIGIN starts on plain http even when a domain was given — TLS isn't
-  # active yet at this point (that happens further down, and may not succeed
-  # at all yet if the domain's DNS isn't live). The nginx/TLS step upgrades
-  # this to https itself, automatically, the moment a certificate exists.
-  if [ -n "$DOMAIN" ]; then
-    CORS_VALUE="http://$DOMAIN"
-  else
-    echo "▸ Detecting the server's public IP..."
-    PUBLIC_IP=$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
-    if [ -z "$PUBLIC_IP" ]; then
-      echo "  WARNING: Could not auto-detect the server's IP — defaulting to localhost. Fix CORS_ORIGIN in .env manually if needed."
-      PUBLIC_IP="localhost"
-    fi
-    CORS_VALUE="http://$PUBLIC_IP"
-  fi
-
+  # DOMAIN/CORS_ORIGIN deliberately NOT asked here — they're handled by the
+  # nginx step further down, which runs on EVERY invocation (not just this
+  # first-time-only block). That's what lets "no domain yet, bought one
+  # later" and "DNS wasn't ready" both resolve the same way: just re-run this
+  # script, it asks/retries exactly what's still missing.
   JWT_ACCESS=$(openssl rand -base64 64 | tr -d '\n')
   JWT_REFRESH=$(openssl rand -base64 64 | tr -d '\n')
   DB_PASS=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 24)
@@ -185,8 +148,6 @@ else
       JWT_ACCESS_SECRET=CHANGE_ME*)  echo "JWT_ACCESS_SECRET=$JWT_ACCESS" ;;
       JWT_REFRESH_SECRET=CHANGE_ME*) echo "JWT_REFRESH_SECRET=$JWT_REFRESH" ;;
       UPDATER_TOKEN=CHANGE_ME*)      echo "UPDATER_TOKEN=$UPDATER_TOKEN" ;;
-      DOMAIN=)                       echo "DOMAIN=$DOMAIN" ;;
-      CORS_ORIGIN=http://localhost:3001) echo "CORS_ORIGIN=$CORS_VALUE" ;;
       *)                             echo "$line" ;;
     esac
   done < .env.example > .env
@@ -290,14 +251,64 @@ else
   echo "  Run manually: UPDATER_TOKEN=... python3 $CLIENT_DIR/updater/daemon.py"
 fi
 
-# 10. Configure nginx (path-based routing: / -> frontend, /api -> backend) and
-# TLS. Runs on EVERY invocation and is fully idempotent — this is deliberately
-# the recovery path for "the domain's DNS wasn't ready during the first run":
-# just re-run this script after fixing DNS and it retries the certificate,
-# nothing else needs to be repeated by hand.
-echo "▸ Configuring nginx..."
+# 10. Domain, then nginx (path-based routing: / -> frontend, /api -> backend)
+# and TLS. Runs on EVERY invocation and is fully idempotent — this is
+# deliberately the recovery path for both "no domain yet, bought one later"
+# and "the domain's DNS wasn't ready during the first run": just re-run this
+# script and it asks/retries exactly whatever's still missing, nothing else
+# needs to be repeated by hand.
 
 DOMAIN=$(grep -E '^DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+
+if [ -z "$DOMAIN" ]; then
+  DOMAIN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+  printf "▸ Do you have a domain pointing at this server? (y/n): "
+  read -r HAS_DOMAIN
+  case "$HAS_DOMAIN" in
+    y|Y|yes|Yes|YES)
+      while true; do
+        printf "  Enter the domain (e.g. example.com): "
+        read -r DOMAIN_INPUT
+        # Forgive a pasted protocol/trailing slash/stray whitespace before validating.
+        DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | sed -E 's#^https?://##; s#/+$##' | tr -d '[:space:]')
+        if echo "$DOMAIN_INPUT" | grep -Eq "$DOMAIN_REGEX"; then
+          DOMAIN="$DOMAIN_INPUT"
+          break
+        fi
+        echo "  Not a valid domain (expected something like example.com) — try again."
+      done
+      TMP_ENV=$(mktemp)
+      awk -v val="DOMAIN=$DOMAIN" '/^DOMAIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+      TMP_ENV=$(mktemp)
+      awk -v val="CORS_ORIGIN=http://$DOMAIN" '/^CORS_ORIGIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+      echo "  Domain saved — requesting a TLS certificate for it below."
+      ;;
+    *)
+      echo "  No domain — the CRM will be reachable by this server's IP address instead."
+      ;;
+  esac
+fi
+
+# Still no domain (declined above, or on a previous run) — point CORS_ORIGIN at
+# the server's real IP instead of leaving it on the .env.example placeholder.
+# Only fires while CORS_ORIGIN is still that exact stock value, so this runs
+# at most once and never overwrites a manually customized value.
+if [ -z "$DOMAIN" ]; then
+  CURRENT_CORS=$(grep -E '^CORS_ORIGIN=' .env 2>/dev/null | cut -d= -f2-)
+  if [ "$CURRENT_CORS" = "http://localhost:3001" ]; then
+    echo "▸ Detecting the server's public IP..."
+    PUBLIC_IP=$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$PUBLIC_IP" ]; then
+      TMP_ENV=$(mktemp)
+      awk -v val="CORS_ORIGIN=http://$PUBLIC_IP" '/^CORS_ORIGIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+    else
+      echo "  WARNING: Could not auto-detect the server's IP — leaving CORS_ORIGIN as-is. Fix it in .env manually if needed."
+    fi
+  fi
+fi
+
+echo "▸ Configuring nginx..."
+
 FRONTEND_PORT_VAL=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
 BACKEND_PORT_VAL=$(grep -E '^BACKEND_PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
 FRONTEND_PORT_VAL=${FRONTEND_PORT_VAL:-3001}
@@ -306,6 +317,12 @@ BACKEND_PORT_VAL=${BACKEND_PORT_VAL:-3000}
 if [ "$PKG_MANAGER" = "apt" ]; then
   NGINX_CONF_PATH="/etc/nginx/sites-available/adsicrm"
   NGINX_ENABLED_PATH="/etc/nginx/sites-enabled/adsicrm"
+  # Debian/Ubuntu's nginx package ships this pre-enabled with its own
+  # `listen 80 default_server;` — left in place, it wins over our vhost for
+  # any request nginx can't otherwise match, serving the stock "Welcome to
+  # nginx!" page instead of the CRM. Safe to remove: only the sites-enabled
+  # symlink, the real file stays untouched in sites-available.
+  $SUDO rm -f /etc/nginx/sites-enabled/default
 else
   NGINX_CONF_PATH="/etc/nginx/conf.d/adsicrm.conf"
   NGINX_ENABLED_PATH=""

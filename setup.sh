@@ -358,15 +358,20 @@ NGINXCONF
   if [ -n "$NGINX_ENABLED_PATH" ] && [ ! -e "$NGINX_ENABLED_PATH" ]; then
     $SUDO ln -s "$NGINX_CONF_PATH" "$NGINX_ENABLED_PATH"
   fi
-
-  if $SUDO nginx -t >/dev/null 2>&1; then
-    $SUDO systemctl reload nginx >/dev/null 2>&1 || $SUDO service nginx reload >/dev/null 2>&1 || true
-    echo "  nginx configured (listening on :80)."
-  else
-    echo "  WARNING: nginx config test failed — check '$SUDO nginx -t' manually."
-  fi
 else
-  echo "  nginx already configured, skipping."
+  echo "  nginx vhost already configured, skipping."
+fi
+
+# Always reloaded — not just when the vhost above was freshly written. The
+# default-site removal a few lines up only takes effect once nginx re-reads
+# its config; skipping this on "vhost already existed" runs left the default
+# site's `default_server` still active in nginx's running state even after
+# its file was deleted from disk.
+if $SUDO nginx -t >/dev/null 2>&1; then
+  $SUDO systemctl reload nginx >/dev/null 2>&1 || $SUDO service nginx reload >/dev/null 2>&1 || true
+  echo "  nginx configured (listening on :80)."
+else
+  echo "  WARNING: nginx config test failed — check '$SUDO nginx -t' manually."
 fi
 
 # TLS — only possible with a real domain (Let's Encrypt won't issue for bare

@@ -8,14 +8,27 @@ container. This daemon is the one piece of the update mechanism that has to
 sit outside Docker entirely, so it survives the compose recreation it
 triggers.
 
-The backend container reaches it over host.docker.internal, authenticated
-with a shared secret (UPDATER_TOKEN, generated once by setup.sh) — this
-process binds to 127.0.0.1 only and is never exposed beyond that.
+The backend container reaches it over host.docker.internal, which resolves to
+the docker bridge's gateway IP (e.g. 172.18.0.1) — NOT loopback — so this
+process has to bind 0.0.0.0 to be reachable at all; a socket bound to
+127.0.0.1 only accepts traffic arriving on the loopback interface itself; a
+container reaching in over the bridge on a different interface than the
+process is listening on would just be refused, "unreachable" is where it
+went. Since binding 0.0.0.0 also means it is technically visible to the
+public network interface, this is guarded by two independent layers: the
+shared-secret token below, and an IP allowlist that rejects anything outside
+private/loopback ranges before it ever gets to the token check — so even if
+the host's own firewall isn't configured, nothing on the public internet can
+reach past this daemon.
+
+Authenticated with a shared secret (UPDATER_TOKEN, generated once by
+setup.sh).
 
 Installed and started as a systemd service by setup.sh (unit:
 adsicrm-updater), so it restarts on crash and starts on boot without needing
 a container or a login shell to keep it alive.
 """
+import ipaddress
 import json
 import os
 import subprocess
@@ -86,10 +99,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _client_allowed(self):
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_private
+        except ValueError:
+            return False
+
     def _authorized(self):
         return bool(TOKEN) and self.headers.get("X-Updater-Token") == TOKEN
 
     def do_GET(self):
+        if not self._client_allowed():
+            self._json({"error": "forbidden"}, 403)
+            return
         if not self._authorized():
             self._json({"error": "unauthorized"}, 401)
             return
@@ -107,6 +129,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._client_allowed():
+            self._json({"error": "forbidden"}, 403)
+            return
         if not self._authorized():
             self._json({"error": "unauthorized"}, 401)
             return
@@ -134,5 +159,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("UPDATER_TOKEN is not set — refusing to start with no auth.")
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()

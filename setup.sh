@@ -243,7 +243,12 @@ WantedBy=multi-user.target
 EOF
 
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now adsicrm-updater
+  $SUDO systemctl enable adsicrm-updater >/dev/null 2>&1
+  # restart, not "enable --now" — if the daemon is already running, --now is a
+  # no-op (systemd only starts inactive units), so a `git pull` that changed
+  # daemon.py would otherwise sit there unapplied until someone manually
+  # restarted the service. restart always picks up whatever's on disk now.
+  $SUDO systemctl restart adsicrm-updater
   echo "  Updater daemon installed and running (systemd unit: adsicrm-updater)."
 else
   echo "  WARNING: systemctl not found — skipping updater daemon install."

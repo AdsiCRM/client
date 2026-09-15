@@ -264,32 +264,62 @@ fi
 # needs to be repeated by hand.
 
 DOMAIN=$(grep -E '^DOMAIN=' .env 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+OLD_DOMAIN="$DOMAIN"
+DOMAIN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+
+# Sets NEW_DOMAIN once a valid one is entered — shared by both the
+# first-time-setup prompt below and the "change domain" prompt.
+prompt_for_domain() {
+  while true; do
+    printf "  Enter the domain (e.g. example.com): "
+    read -r DOMAIN_INPUT
+    # Forgive a pasted protocol/trailing slash/stray whitespace before validating.
+    DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | sed -E 's#^https?://##; s#/+$##' | tr -d '[:space:]')
+    if echo "$DOMAIN_INPUT" | grep -Eq "$DOMAIN_REGEX"; then
+      NEW_DOMAIN="$DOMAIN_INPUT"
+      return
+    fi
+    echo "  Not a valid domain (expected something like example.com) — try again."
+  done
+}
+
+save_domain() {
+  TMP_ENV=$(mktemp)
+  awk -v val="DOMAIN=$1" '/^DOMAIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+  TMP_ENV=$(mktemp)
+  awk -v val="CORS_ORIGIN=http://$1" '/^CORS_ORIGIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+}
 
 if [ -z "$DOMAIN" ]; then
-  DOMAIN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
   printf "▸ Do you have a domain pointing at this server? (y/n): "
   read -r HAS_DOMAIN
   case "$HAS_DOMAIN" in
     y|Y|yes|Yes|YES)
-      while true; do
-        printf "  Enter the domain (e.g. example.com): "
-        read -r DOMAIN_INPUT
-        # Forgive a pasted protocol/trailing slash/stray whitespace before validating.
-        DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | sed -E 's#^https?://##; s#/+$##' | tr -d '[:space:]')
-        if echo "$DOMAIN_INPUT" | grep -Eq "$DOMAIN_REGEX"; then
-          DOMAIN="$DOMAIN_INPUT"
-          break
-        fi
-        echo "  Not a valid domain (expected something like example.com) — try again."
-      done
-      TMP_ENV=$(mktemp)
-      awk -v val="DOMAIN=$DOMAIN" '/^DOMAIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
-      TMP_ENV=$(mktemp)
-      awk -v val="CORS_ORIGIN=http://$DOMAIN" '/^CORS_ORIGIN=/{print val; next} {print}' .env > "$TMP_ENV" && mv "$TMP_ENV" .env
+      prompt_for_domain
+      DOMAIN="$NEW_DOMAIN"
+      save_domain "$DOMAIN"
       echo "  Domain saved — requesting a TLS certificate for it below."
       ;;
     *)
       echo "  No domain — the CRM will be reachable by this server's IP address instead."
+      ;;
+  esac
+else
+  printf "▸ Keep the current domain (%s)? (y/n): " "$DOMAIN"
+  read -r KEEP_DOMAIN
+  case "$KEEP_DOMAIN" in
+    n|N|no|No|NO)
+      prompt_for_domain
+      if [ "$NEW_DOMAIN" != "$DOMAIN" ]; then
+        DOMAIN="$NEW_DOMAIN"
+        save_domain "$DOMAIN"
+        echo "  Domain updated to $DOMAIN — requesting a new TLS certificate for it below."
+      else
+        echo "  Same domain, nothing to change."
+      fi
+      ;;
+    *)
+      echo "  Keeping $DOMAIN."
       ;;
   esac
 fi
@@ -333,6 +363,17 @@ else
   NGINX_ENABLED_PATH=""
 fi
 
+# Domain changed to a different, non-empty value — start the vhost fresh
+# rather than trying to rename server_name in place. If certbot already ran
+# for the OLD domain, this same file has an SSL block whose ssl_certificate
+# paths point at the old domain's certificate files; renaming just the
+# server_name would leave those paths dangling for the new domain. Recreated
+# below as plain HTTP, then certbot runs fresh for the new domain.
+if [ -n "$OLD_DOMAIN" ] && [ -n "$DOMAIN" ] && [ "$OLD_DOMAIN" != "$DOMAIN" ] && [ -f "$NGINX_CONF_PATH" ]; then
+  echo "▸ Domain changed ($OLD_DOMAIN → $DOMAIN) — resetting nginx vhost..."
+  $SUDO rm -f "$NGINX_CONF_PATH" "$NGINX_ENABLED_PATH"
+fi
+
 # Only ever created once — certbot rewrites this same file in place once a
 # certificate is issued (adds the SSL server block + http->https redirect),
 # and re-running this script must never clobber that back to plain HTTP.
@@ -365,6 +406,16 @@ NGINXCONF
   fi
 else
   echo "  nginx vhost already configured, skipping."
+fi
+
+# Fix server_name if it's still the catch-all placeholder while a real domain
+# is now known — e.g. the vhost was first created before any domain was set,
+# or was just recreated fresh above. certbot's nginx plugin matches blocks by
+# server_name and can't find/augment one that still says "_", which is
+# exactly what silently breaks TLS while cert issuance itself still succeeds.
+if [ -n "$DOMAIN" ] && [ -f "$NGINX_CONF_PATH" ] && ! grep -q "server_name $DOMAIN;" "$NGINX_CONF_PATH"; then
+  echo "▸ Updating nginx server_name to $DOMAIN..."
+  $SUDO sed -i "s/server_name _;/server_name $DOMAIN;/" "$NGINX_CONF_PATH"
 fi
 
 # Always reloaded — not just when the vhost above was freshly written. The

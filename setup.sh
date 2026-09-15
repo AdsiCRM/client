@@ -431,10 +431,16 @@ else
 fi
 
 # TLS — only possible with a real domain (Let's Encrypt won't issue for bare
-# IPs). Safe to retry: skips outright if a certificate already exists.
+# IPs). Gated on nginx actually having a 443 listener, NOT on a cert file
+# existing on disk — a cert can exist while nginx was never wired to use it
+# (e.g. this ran once with a stale server_name, so certbot's nginx plugin
+# couldn't find the block to augment — cert got issued, nginx never touched).
+# Safe to call repeatedly either way: certbot reuses a still-valid existing
+# certificate instead of requesting a new one, it just also (re)does the
+# nginx install step, which is exactly what's needed to recover from that.
 if [ -n "$DOMAIN" ]; then
-  if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-    echo "  TLS certificate for $DOMAIN already present, skipping certbot."
+  if [ -f "$NGINX_CONF_PATH" ] && grep -q "listen 443" "$NGINX_CONF_PATH"; then
+    echo "  nginx already serving $DOMAIN over HTTPS, skipping certbot."
   else
     echo "▸ Requesting a TLS certificate for $DOMAIN..."
     if ! command -v certbot >/dev/null 2>&1; then

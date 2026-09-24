@@ -44,7 +44,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   backend:
-    image: ghcr.io/adsicrm/adsicrm-backend:1.0.8
+    image: ghcr.io/adsicrm/adsicrm-backend:1.0.9
     platform: linux/amd64
     container_name: adsicrm-backend
     restart: always
@@ -62,7 +62,7 @@ services:
       - docker-socket-proxy
 
   frontend:
-    image: ghcr.io/adsicrm/adsicrm-frontend:0.1.7
+    image: ghcr.io/adsicrm/adsicrm-frontend:0.1.8
     platform: linux/amd64
     container_name: adsicrm-frontend
     restart: always
